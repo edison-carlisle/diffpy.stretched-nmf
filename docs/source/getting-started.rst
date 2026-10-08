@@ -68,6 +68,7 @@ The main entry point is the ``SNMFOptimizer`` class. Create an
        eta=0,
        random_state=7,
        show_plots=False,
+       uniform_stretch=False,
    )
 
    snmf.fit(source_matrix=source_matrix, reset=True)
@@ -81,6 +82,8 @@ Notes
 
 - ``rho`` controls the stretching penalty (set to ``0`` for no stretching).
 - ``eta`` controls sparsity (start at ``0`` and tune after selecting ``rho``).
+- Set ``uniform_stretch=True`` to share one stretch factor per signal across
+  all components.
 - Use ``reset=False`` only when you want to continue from the current solution.
 
 XRD example

@@ -43,6 +43,42 @@ def test_fit_recovers_rank_one_factors():
     assert np.allclose(model.weights_, expected_weights, rtol=0.2, atol=0.1)
 
 
+def test_uniform_stretch_is_shared_across_components():
+    source = np.ones((5, 3))
+    init_weights = np.ones((2, 3))
+    init_components = np.ones((5, 2))
+    init_stretch = np.array([0.9, 1.0, 1.1])
+
+    model = SNMFOptimizer(
+        n_components=2,
+        uniform_stretch=True,
+        rho=0.1,
+        random_state=1,
+        max_iter=1,
+        min_iter=0,
+        stretch_slow_iter=0,
+    )
+    model.fit(
+        source,
+        init_weights=init_weights,
+        init_components=init_components,
+        init_stretch=init_stretch,
+    )
+
+    assert model.stretch_.shape == (2, 3)
+    assert np.allclose(model.stretch_[0], model.stretch_[1])
+
+
+def test_uniform_stretch_rejects_nonuniform_initial_values():
+    model = SNMFOptimizer(n_components=2, uniform_stretch=True)
+
+    with pytest.raises(ValueError, match="same stretch factor"):
+        model._initialize_factors(
+            source_matrix=np.ones((4, 2)),
+            init_stretch=np.array([[1.0, 1.0], [1.0, 1.1]]),
+        )
+
+
 def test_cubic_largest_real_root_preserves_tiny_zero_q_root():
     root = _cubic_largest_real_root(np.array([[-1e-300]]), np.zeros((1, 1)))
 

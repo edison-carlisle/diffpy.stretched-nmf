@@ -60,6 +60,8 @@ class SNMFOptimizer:
     random_state : int
         The seed for the initial guesses at the matrices (stretch, components,
         and weights) created by the decomposition.
+    uniform_stretch : bool
+        Whether to share one stretch factor per signal across all components.
     n_components_ : int
         The learned number of components from initialization.
     signal_length_ : int
@@ -88,6 +90,7 @@ class SNMFOptimizer:
         verbose=False,
         stretch_max_iter=8,
         stretch_slow_iter=200,
+        uniform_stretch=False,
     ):
         """Initialize an instance of sNMF with estimator
         hyperparameters.
@@ -126,6 +129,10 @@ class SNMFOptimizer:
             Number of initial outer-loop stretch updates to solve with the
             slower constrained optimizer before switching to projected-gradient
             stretch updates. Optional.
+        uniform_stretch : bool
+            If ``True``, use one stretch factor per signal and share it across
+            all components. The fitted ``stretch_`` attribute retains its
+            ``(n_components, n_signals)`` shape with identical rows.
         """
         if n_components is not None and n_components < 1:
             raise ValueError("n_components must be a positive integer.")
@@ -147,6 +154,7 @@ class SNMFOptimizer:
         self.verbose = verbose
         self.stretch_max_iter = stretch_max_iter
         self.stretch_slow_iter = stretch_slow_iter
+        self.uniform_stretch = uniform_stretch
 
         self._rng = np.random.default_rng(self.random_state)
         self._plotter = SNMFPlotter() if self.show_plots else None
@@ -188,13 +196,17 @@ class SNMFOptimizer:
                 )
 
         if init_stretch is None:
-            stretch = np.ones(
-                (n_components, self.n_signals_)
-            ) + self._rng.normal(
+            stretch_shape = (
+                1 if self.uniform_stretch else n_components,
+                self.n_signals_,
+            )
+            stretch = np.ones(stretch_shape) + self._rng.normal(
                 0,
                 1e-3,
-                size=(n_components, self.n_signals_),
+                size=stretch_shape,
             )
+            if self.uniform_stretch:
+                stretch = np.repeat(stretch, n_components, axis=0)
         else:
             stretch = np.asarray(init_stretch, dtype=float)
 
@@ -212,7 +224,26 @@ class SNMFOptimizer:
                 "init_weights must have shape "
                 f"{expected_weights_shape}, got {weights.shape}."
             )
-        if stretch.shape != expected_stretch_shape:
+        if self.uniform_stretch:
+            if stretch.shape == (self.n_signals_,):
+                stretch = stretch[None, :]
+            elif stretch.shape == (1, self.n_signals_):
+                pass
+            elif stretch.shape == expected_stretch_shape:
+                if not np.allclose(stretch, stretch[0:1, :]):
+                    raise ValueError(
+                        "init_stretch must use the same stretch factor for "
+                        "every component when uniform_stretch=True."
+                    )
+                stretch = stretch[0:1, :]
+            else:
+                raise ValueError(
+                    "init_stretch must have shape "
+                    f"{expected_stretch_shape}, (1, {self.n_signals_}), or "
+                    f"({self.n_signals_},), got {stretch.shape}."
+                )
+            stretch = np.repeat(stretch, n_components, axis=0)
+        elif stretch.shape != expected_stretch_shape:
             raise ValueError(
                 "init_stretch must have shape "
                 f"{expected_stretch_shape}, got {stretch.shape}."
@@ -241,6 +272,40 @@ class SNMFOptimizer:
             shape=(self.n_signals_ - 2, self.n_signals_),
             dtype=float,
         )
+
+    def _expand_stretch(self, stretch):
+        """Return stretch factors in the internal matrix representation."""
+        stretch = np.asarray(stretch, dtype=float)
+        if not self.uniform_stretch:
+            if stretch.ndim == 1 and stretch.size == self.stretch_.size:
+                return stretch.reshape(self.stretch_.shape)
+            return stretch
+
+        expected_shape = (self.n_components_, self.n_signals_)
+        if stretch.shape == (self.n_signals_,):
+            stretch = stretch[None, :]
+        if stretch.shape == (1, self.n_signals_):
+            return np.broadcast_to(
+                stretch, expected_shape
+            ).copy()
+        if stretch.shape != expected_shape:
+            raise ValueError(
+                "stretch must have shape "
+                f"{expected_shape} or ({self.n_signals_},), got "
+                f"{stretch.shape}."
+            )
+        if not np.allclose(stretch, stretch[0:1, :]):
+            raise ValueError(
+                "stretch must use the same factor for every component "
+                "when uniform_stretch=True."
+            )
+        return stretch
+
+    def _stretch_variables(self):
+        """Return the independent variables used to optimize stretching."""
+        if self.uniform_stretch:
+            return self.stretch_[0, :].copy()
+        return self.stretch_.copy()
 
     def fit(
         self,
@@ -652,6 +717,7 @@ class SNMFOptimizer:
             weights = self.weights_
         if stretch is None:
             stretch = self.stretch_
+        stretch = self._expand_stretch(stretch)
 
         if self._fill_tail_zero:
             reconstructed_matrix = self._reconstruct_from_stretched_components(
@@ -707,7 +773,9 @@ class SNMFOptimizer:
         return SNMFOptimizer._compute_objective_function(
             components=self.components_ if components is None else components,
             residuals=self.residuals_ if residuals is None else residuals,
-            stretch=self.stretch_ if stretch is None else stretch,
+            stretch=self._expand_stretch(
+                self.stretch_ if stretch is None else stretch
+            ),
             rho=self.rho,
             eta=self.eta,
             spline_smooth_operator=self._spline_smooth_operator,
@@ -748,6 +816,7 @@ class SNMFOptimizer:
             weights = self.weights_
         if stretch is None:
             stretch = self.stretch_
+        stretch = self._expand_stretch(stretch)
 
         # Dimensions
         signal_len = components.shape[0]  # number of samples
@@ -819,6 +888,7 @@ class SNMFOptimizer:
         coefficients `weights`."""
         if stretch is None:
             stretch = self.stretch_
+        stretch = self._expand_stretch(stretch)
         if weights is None:
             weights = self.weights_
         if residuals is None:
@@ -892,6 +962,7 @@ class SNMFOptimizer:
     ):
         if stretch is None:
             stretch = self.stretch_
+        stretch = self._expand_stretch(stretch)
         if weights is None:
             weights = self.weights_
         if residuals is None:
@@ -1119,6 +1190,7 @@ class SNMFOptimizer:
     def _regularize_function(self, stretch=None):
         if stretch is None:
             stretch = self.stretch_
+        stretch = self._expand_stretch(stretch)
 
         residuals, d_stretch_comps, _ = self._stretch_residual_and_derivatives(
             stretch
@@ -1137,6 +1209,11 @@ class SNMFOptimizer:
             @ (self._spline_smooth_operator.T @ self._spline_smooth_operator)
         )
 
+        if self.uniform_stretch:
+            # One shared variable controls every component for a given
+            # signal, so combine the component-wise derivatives.
+            gra = np.sum(gra, axis=0)
+
         return fun, gra
 
     def _regularize_function_hessian(self, stretch):
@@ -1154,8 +1231,9 @@ class SNMFOptimizer:
 
         Returns
         -------
-        ndarray of shape (n_components * n_signals, n_components * n_signals)
-            Symmetric Hessian matrix for the flattened stretch variables.
+        ndarray
+            Symmetric Hessian matrix for the flattened stretch variables. In
+            uniform mode, the shape is ``(n_signals, n_signals)``.
         """
         residuals, d_stretch_comps, dd_stretch_comps = (
             self._stretch_residual_and_derivatives(stretch)
@@ -1189,7 +1267,20 @@ class SNMFOptimizer:
                 self.rho * smooth_hessian
             )
 
-        return 0.5 * (hessian + hessian.T)
+        hessian = 0.5 * (hessian + hessian.T)
+        if self.uniform_stretch:
+            # Map the full (component, signal) Hessian onto the independent
+            # per-signal stretch variables.
+            variable_map = np.zeros(
+                (n_variables, self.n_signals_), dtype=float
+            )
+            for comp in range(self.n_components_):
+                variable_map[
+                    comp * self.n_signals_ : (comp + 1) * self.n_signals_,
+                    :,
+                ] = np.eye(self.n_signals_)
+            hessian = variable_map.T @ hessian @ variable_map
+        return hessian
 
     @staticmethod
     def _project_stretch(stretch, lower_bound=0.1):
@@ -1199,11 +1290,11 @@ class SNMFOptimizer:
         if self._stretch_step_size is not None:
             return self._stretch_step_size
 
-        gradient_norm = np.linalg.norm(gradient, "fro")
+        gradient_norm = np.linalg.norm(gradient)
         if gradient_norm == 0 or not np.isfinite(gradient_norm):
             return 1.0
 
-        stretch_norm = max(np.linalg.norm(stretch, "fro"), 1.0)
+        stretch_norm = max(np.linalg.norm(stretch), 1.0)
         return 0.05 * stretch_norm / gradient_norm
 
     def _update_stretch_trust_constr(self):
@@ -1213,21 +1304,18 @@ class SNMFOptimizer:
             print("Updating stretch factors...")
 
         # Flatten stretch for compatibility with the optimizer
-        # (since SciPy expects 1D input)
-        stretch_flat_initial = self.stretch_.flatten()
+        # (since SciPy expects 1D input). Uniform stretching has one
+        # independent variable per signal rather than one per component.
+        stretch_flat_initial = self._stretch_variables().flatten()
 
         # Define the optimization function
         def objective(stretch_vec):
-            stretch_matrix = stretch_vec.reshape(
-                self.stretch_.shape
-            )  # Reshape back to matrix form
-            fun, gra = self._regularize_function(stretch_matrix)
+            fun, gra = self._regularize_function(stretch_vec)
             gra = gra.flatten()
             return fun, gra
 
         def hessian(stretch_vec):
-            stretch_matrix = stretch_vec.reshape(self.stretch_.shape)
-            return self._regularize_function_hessian(stretch_matrix)
+            return self._regularize_function_hessian(stretch_vec)
 
         unconstrained_result = minimize(
             fun=lambda stretch_vec: objective(stretch_vec)[0],
@@ -1237,16 +1325,14 @@ class SNMFOptimizer:
             hess=hessian,
             options={"maxiter": 300},
         )
-        unconstrained_stretch = unconstrained_result.x.reshape(
-            self.stretch_.shape
-        )
+        unconstrained_stretch = unconstrained_result.x
         if np.all(unconstrained_stretch >= 0.1):
             current_objective = self._regularize_function(self.stretch_)[0]
             candidate_objective = self._regularize_function(
                 unconstrained_stretch
             )[0]
             if candidate_objective <= current_objective:
-                self.stretch_ = unconstrained_stretch
+                self.stretch_ = self._expand_stretch(unconstrained_stretch)
                 return
 
         # Optimization constraints: lower bound 0.1, no upper bound
@@ -1265,7 +1351,7 @@ class SNMFOptimizer:
         )
 
         # Update stretch with the optimized values
-        self.stretch_ = result.x.reshape(self.stretch_.shape)
+        self.stretch_ = self._expand_stretch(result.x)
         self._stretch_step_size = None
 
     def _update_stretch_projected_gradient(self):
@@ -1273,7 +1359,7 @@ class SNMFOptimizer:
             print("Updating stretch factors...")
 
         for _ in range(self.stretch_max_iter):
-            stretch = self.stretch_
+            stretch = self._stretch_variables()
             current_objective, gradient = self._regularize_function(stretch)
             step_size = self._initial_stretch_step_size(stretch, gradient)
             best_stretch = stretch
@@ -1284,7 +1370,7 @@ class SNMFOptimizer:
                     stretch - step_size * gradient
                 )
                 step = candidate_stretch - stretch
-                step_norm_sq = np.linalg.norm(step, "fro") ** 2
+                step_norm_sq = np.linalg.norm(step) ** 2
                 if step_norm_sq == 0:
                     step_size *= 0.5
                     continue
@@ -1312,7 +1398,7 @@ class SNMFOptimizer:
             if best_objective >= current_objective:
                 break
 
-            self.stretch_ = best_stretch
+            self.stretch_ = self._expand_stretch(best_stretch)
 
     def _update_stretch(self):
         """Update stretching factors with a hybrid strategy.
