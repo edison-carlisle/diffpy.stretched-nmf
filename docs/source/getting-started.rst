@@ -86,6 +86,72 @@ Notes
   all components.
 - Use ``reset=False`` only when you want to continue from the current solution.
 
+Optional exponential damping
+----------------------------
+
+Damping is off by default. Select the components to fit by their zero-based
+indices, for example ``damping_components=[0, 2]`` to fit rates for the first
+and third components. A selected component contributes
+
+.. math::
+
+   y_k^m x_k(r / a_k^m) \exp(-\lambda_k^m r).
+
+Each selected component has a separate nonnegative rate for each signal
+(column) ``m``. Components excluded from damping keep rates exactly zero.
+The rate is :math:`\lambda = 1 / \xi`, in inverse units of ``r``. A rate
+of zero represents the original undamped model exactly, with infinite decay
+length. Damping can be fitted with ``rho=0`` (no stretching) or combined with
+component-specific or uniform stretching.
+
+.. code-block:: python
+
+   r = np.linspace(0.0, 30.0, source_matrix.shape[0])
+   snmf = SNMFOptimizer(
+       n_components=3,
+       damping_components=[0, 2],
+       damping_regularization=1.0,
+       random_state=7,
+   )
+   snmf.fit(source_matrix, r=r)
+   rates = snmf.decay_rates_  # shape (3, number_of_signals)
+   # rates[1, :] is exactly zero: component 1 is excluded.
+   decay_lengths = np.full_like(rates, np.inf)
+   np.divide(1.0, rates, out=decay_lengths, where=rates > 0)
+
+``r`` must be a finite, nonnegative, strictly increasing array with one
+coordinate per source row. The profiles are interpolated at ``r / a`` on
+this grid, while damping is evaluated at the observed ``r``, after stretching.
+Without ``r``, sample indices are used and rates have inverse sample units.
+``init_decay_rates`` can provide an initial matrix of the same shape as the
+weights; it defaults to zero and must be zero for excluded components.
+
+``damping_regularization`` is independent of ``rho`` and ``eta`` and adds
+
+.. math::
+
+   \frac{\text{damping_regularization}}{2}
+   \sum_k \sum_{m=0}^{M-3}
+   (\lambda_k^{m+2} - 2\lambda_k^{m+1} + \lambda_k^m)^2.
+
+It follows the order of the source columns, assuming equally spaced signals.
+Linear rate trends have zero penalty. With fewer than three signals, the
+penalty is zero. A weight of zero disables only this penalty; selected rates
+are still fitted. ``None`` or ``[]`` for ``damping_components`` disables
+damping entirely.
+
+Rates retain their physical units through result normalization. Warm starts
+(``reset=False``) reuse the fitted rates and grid; an explicitly supplied
+``r`` must match the existing grid.
+
+When profiles are free, a common decay envelope can be absorbed into a
+component profile. For example, without stretching, replacing ``x(r)`` with
+``x(r) * exp(-c * r)`` and every rate with ``lambda - c`` gives the same
+reconstruction whenever the new rates remain nonnegative. Absolute decay
+lengths therefore require an undamped reference signal or prior information
+about the component profiles. Initialization and regularization can influence
+which solution the optimizer finds.
+
 XRD example
 -----------
 

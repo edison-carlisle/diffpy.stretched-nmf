@@ -4,7 +4,7 @@ import time
 import cvxpy as cp
 import numpy as np
 from scipy.optimize import minimize
-from scipy.sparse import coo_matrix, diags
+from scipy.sparse import coo_matrix, csr_matrix, diags
 
 from diffpy.stretched_nmf.plotter import SNMFPlotter
 
@@ -62,6 +62,17 @@ class SNMFOptimizer:
         and weights) created by the decomposition.
     uniform_stretch : bool
         Whether to share one stretch factor per signal across all components.
+    damping_components : list of int or None
+        Zero-based component indices whose decay rates are fitted. ``None``
+        (the default) or an empty sequence disables damping.
+    damping_regularization : float
+        Nonnegative weight for the second-difference penalty on decay rates
+        across signals, independent of ``rho`` and ``eta``.
+    decay_rates_ : numpy.ndarray
+        Nonnegative decay rates of shape ``(n_components, n_signals)`` in
+        inverse units of ``r_``. Excluded components have rates exactly zero.
+    r_ : numpy.ndarray
+        Sample coordinates, defaulting to ``np.arange(signal_length_)``.
     n_components_ : int
         The learned number of components from initialization.
     signal_length_ : int
@@ -91,6 +102,8 @@ class SNMFOptimizer:
         stretch_max_iter=8,
         stretch_slow_iter=200,
         uniform_stretch=False,
+        damping_components=None,
+        damping_regularization=0.0,
     ):
         """Initialize an instance of sNMF with estimator
         hyperparameters.
@@ -133,6 +146,14 @@ class SNMFOptimizer:
             If ``True``, use one stretch factor per signal and share it across
             all components. The fitted ``stretch_`` attribute retains its
             ``(n_components, n_signals)`` shape with identical rows.
+        damping_components : list of int or None
+            Zero-based indices of components to fit for exponential damping.
+            Each selected component has an independent rate per signal.
+            ``None`` or ``[]`` disables damping and preserves the original
+            model. Rates for excluded components remain exactly zero.
+        damping_regularization : float
+            Nonnegative weight for half the squared norm of the second
+            differences of decay rates across signals. Defaults to zero.
         """
         if n_components is not None and n_components < 1:
             raise ValueError("n_components must be a positive integer.")
@@ -141,6 +162,13 @@ class SNMFOptimizer:
         if not isinstance(stretch_slow_iter, int) or stretch_slow_iter < 0:
             raise ValueError(
                 "stretch_slow_iter must be a non-negative integer."
+            )
+        if (
+            not np.isfinite(damping_regularization)
+            or damping_regularization < 0
+        ):
+            raise ValueError(
+                "damping_regularization must be finite and non-negative."
             )
 
         self.n_components = n_components
@@ -155,6 +183,8 @@ class SNMFOptimizer:
         self.stretch_max_iter = stretch_max_iter
         self.stretch_slow_iter = stretch_slow_iter
         self.uniform_stretch = uniform_stretch
+        self.damping_components = damping_components
+        self.damping_regularization = damping_regularization
 
         self._rng = np.random.default_rng(self.random_state)
         self._plotter = SNMFPlotter() if self.show_plots else None
@@ -167,6 +197,8 @@ class SNMFOptimizer:
         init_weights=None,
         init_components=None,
         init_stretch=None,
+        init_decay_rates=None,
+        r=None,
     ):
         self._rng = np.random.default_rng(self.random_state)
         self.signal_length_, self.n_signals_ = source_matrix.shape
@@ -259,22 +291,125 @@ class SNMFOptimizer:
         self.stretch_ = stretch
         self.components_ = np.maximum(0, components)
 
+        self._set_r_grid(r)
+        self._damping_mask = np.zeros(n_components, dtype=bool)
+        if self.damping_components is not None:
+            indices = np.asarray(self.damping_components)
+            if indices.ndim != 1 or (
+                indices.size
+                and (
+                    indices.dtype.kind not in "iu"
+                    or np.any(indices < 0)
+                    or np.any(indices >= n_components)
+                )
+            ):
+                raise ValueError(
+                    "damping_components must be a sequence of zero-based "
+                    "component indices less than n_components."
+                )
+            self._damping_mask[indices.astype(int)] = True
+        self.decay_rates_ = np.zeros(expected_weights_shape)
+        if init_decay_rates is not None:
+            rates = np.asarray(init_decay_rates, dtype=float)
+            if rates.shape != expected_weights_shape:
+                raise ValueError(
+                    "init_decay_rates must have shape "
+                    f"{expected_weights_shape}, got {rates.shape}."
+                )
+            if not np.all(np.isfinite(rates)) or np.any(rates < 0):
+                raise ValueError(
+                    "init_decay_rates must be finite and non-negative."
+                )
+            if np.any(rates[~self._damping_mask] != 0):
+                raise ValueError(
+                    "init_decay_rates must be zero for components excluded "
+                    "from damping."
+                )
+            self.decay_rates_ = rates.copy()
+
         self._init_components = self.components_.copy()
         self._init_weights = self.weights_.copy()
         self._init_stretch = self.stretch_.copy()
+        self._init_decay_rates = self.decay_rates_.copy()
         self._fill_tail_zero = False
         self._stretch_step_size = None
 
         # Second-order spline: Tridiagonal (-2 on diags, 1 on sub/superdiags)
-        self._spline_smooth_operator = 0.25 * diags(
-            [1, -2, 1],
-            offsets=[0, 1, 2],
-            shape=(self.n_signals_ - 2, self.n_signals_),
-            dtype=float,
+        self._rate_smooth_operator = (
+            diags(
+                [1, -2, 1],
+                offsets=[0, 1, 2],
+                shape=(max(self.n_signals_ - 2, 0), self.n_signals_),
+                dtype=float,
+            )
+            if self.n_signals_ >= 3
+            else csr_matrix((0, self.n_signals_))
+        )
+        self._spline_smooth_operator = 0.25 * self._rate_smooth_operator
+
+    def _set_r_grid(self, r):
+        """Store the independent coordinates without changing legacy
+        defaults."""
+        self._use_r_grid = r is not None
+        if r is None:
+            self.r_ = np.arange(self.signal_length_, dtype=float)
+            return
+        r = np.asarray(r, dtype=float)
+        if (
+            r.shape != (self.signal_length_,)
+            or not np.all(np.isfinite(r))
+            or np.any(r < 0)
+            or np.any(np.diff(r) <= 0)
+        ):
+            raise ValueError(
+                "r must be a finite, non-negative, strictly increasing "
+                "array with one coordinate per source row."
+            )
+        self.r_ = r.copy()
+
+    def _interpolation_coordinates(self, stretch):
+        """Return fractional indices at r/a and their stretch
+        derivatives."""
+        stretch_inv = 1.0 / stretch
+        if not getattr(self, "_use_r_grid", False):
+            t = (
+                np.arange(self.signal_length_, dtype=float)[:, None, None]
+                * stretch_inv[None, :, :]
+            )
+            di = -t * stretch_inv[None, :, :]
+        elif self.signal_length_ == 1:
+            t = np.zeros((1, *stretch.shape))
+            di = np.zeros_like(t)
+        else:
+            positions = self.r_[:, None, None] * stretch_inv[None, :, :]
+            cells = np.clip(
+                np.searchsorted(self.r_, positions, side="right") - 1,
+                0,
+                self.signal_length_ - 2,
+            )
+            spacing = self.r_[cells + 1] - self.r_[cells]
+            t = cells + (positions - self.r_[cells]) / spacing
+            di = -positions * stretch_inv[None, :, :] / spacing
+        ddi = -di * stretch_inv[None, :, :] * 2.0
+        return t, di, ddi
+
+    def _damping_factors(self, decay_rates=None):
+        rates = self.decay_rates_ if decay_rates is None else decay_rates
+        return np.exp(-self.r_[:, None, None] * rates[None, :, :])
+
+    def _damping_penalty(self, decay_rates=None):
+        if not self.damping_regularization:
+            return 0.0
+        rates = self.decay_rates_ if decay_rates is None else decay_rates
+        return (
+            0.5
+            * self.damping_regularization
+            * np.linalg.norm(self._rate_smooth_operator @ rates.T, "fro") ** 2
         )
 
     def _expand_stretch(self, stretch):
-        """Return stretch factors in the internal matrix representation."""
+        """Return stretch factors in the internal matrix
+        representation."""
         stretch = np.asarray(stretch, dtype=float)
         if not self.uniform_stretch:
             if stretch.ndim == 1 and stretch.size == self.stretch_.size:
@@ -285,9 +420,7 @@ class SNMFOptimizer:
         if stretch.shape == (self.n_signals_,):
             stretch = stretch[None, :]
         if stretch.shape == (1, self.n_signals_):
-            return np.broadcast_to(
-                stretch, expected_shape
-            ).copy()
+            return np.broadcast_to(stretch, expected_shape).copy()
         if stretch.shape != expected_shape:
             raise ValueError(
                 "stretch must have shape "
@@ -302,7 +435,8 @@ class SNMFOptimizer:
         return stretch
 
     def _stretch_variables(self):
-        """Return the independent variables used to optimize stretching."""
+        """Return the independent variables used to optimize
+        stretching."""
         if self.uniform_stretch:
             return self.stretch_[0, :].copy()
         return self.stretch_.copy()
@@ -314,6 +448,8 @@ class SNMFOptimizer:
         init_components=None,
         init_stretch=None,
         reset=True,
+        init_decay_rates=None,
+        r=None,
     ):
         """Run the sNMF optimization on ``source_matrix``.
 
@@ -333,6 +469,25 @@ class SNMFOptimizer:
         reset : bool
             Whether to reinitialize model factors before fitting. If ``False``,
             the previous factor matrices are reused.
+        init_decay_rates : ndarray, optional
+            Initial nonnegative decay rates of shape
+            ``(n_components, n_signals)``. Defaults to zero. Excluded
+            components must have rates zero, including when damping is off.
+        r : ndarray, optional
+            Finite, nonnegative, strictly increasing coordinates with one
+            entry per source row. Used both for stretching at ``r / a`` and
+            damping at the observed ``r``. Defaults to row indices, giving
+            rates in inverse sample units. On warm starts, omitted ``r``
+            reuses the fitted grid; an explicit grid must match it.
+
+        Notes
+        -----
+        A component contributes ``y * x(r / a) * exp(-lambda * r)``.
+        ``lambda = 0`` is exactly undamped (decay length infinity). The
+        second-difference penalty follows column order, assuming equally
+        spaced signals. Free profiles can absorb a common damping envelope;
+        interpreting absolute rates requires an undamped reference or other
+        prior information about the component profiles.
         """
         source_matrix = np.asarray(source_matrix, dtype=float)
         if source_matrix.ndim != 2:
@@ -347,15 +502,21 @@ class SNMFOptimizer:
                 init_weights=init_weights,
                 init_components=init_components,
                 init_stretch=init_stretch,
+                init_decay_rates=init_decay_rates,
+                r=r,
             )
         else:
             if any(
                 v is not None
-                for v in (init_weights, init_components, init_stretch)
+                for v in (
+                    init_weights,
+                    init_components,
+                    init_stretch,
+                    init_decay_rates,
+                )
             ):
                 raise ValueError(
-                    "init_weights, init_components, and init_stretch can only "
-                    "be provided when reset=True."
+                    "Initial factors can only " "be provided when reset=True."
                 )
             if not all(
                 hasattr(self, name)
@@ -363,6 +524,7 @@ class SNMFOptimizer:
                     "components_",
                     "weights_",
                     "stretch_",
+                    "decay_rates_",
                     "n_components_",
                     "signal_length_",
                     "n_signals_",
@@ -379,6 +541,10 @@ class SNMFOptimizer:
                     "Warm-start requires source_matrix to keep the same shape "
                     f"{expected_shape}, got {source_matrix.shape}."
                 )
+            if r is not None and not np.array_equal(r, self.r_):
+                raise ValueError(
+                    "Warm-start requires r to keep the same grid."
+                )
 
         # Set stretch matrix to 1 if no stretching present
         if self.rho == 0:
@@ -392,6 +558,7 @@ class SNMFOptimizer:
             self.components_.copy(),
             self.weights_.copy(),
             self.stretch_.copy(),
+            self.decay_rates_.copy(),
         ]
         self.objective_difference_ = None
         self.objective_log = [
@@ -421,7 +588,10 @@ class SNMFOptimizer:
             np.sqrt(self.components_)
         )  # Square root penalty
         base_obj = (
-            self.objective_function_ - regularization_term - sparsity_term
+            self.objective_function_
+            - regularization_term
+            - sparsity_term
+            - self._damping_penalty()
         )
         if self.verbose:
             print(
@@ -433,7 +603,12 @@ class SNMFOptimizer:
         # Main optimization loop
         for outiter in range(self.max_iter):
             self._outer_iter = outiter
+            previous_objective = self.objective_function_
             self._outer_loop()
+            if np.any(self._damping_mask):
+                self.objective_difference_ = (
+                    previous_objective - self.objective_function_
+                )
             self.n_iter_ = outiter + 1
             # Print diagnostics
             regularization_term = (
@@ -448,7 +623,10 @@ class SNMFOptimizer:
                 np.sqrt(self.components_)
             )  # Square root penalty
             base_obj = (
-                self.objective_function_ - regularization_term - sparsity_term
+                self.objective_function_
+                - regularization_term
+                - sparsity_term
+                - self._damping_penalty()
             )
             convergence_threshold = self.objective_function_ * self.tol
             # Convergence check: Stop if diffun is small
@@ -518,6 +696,7 @@ class SNMFOptimizer:
         self.components_ = self.best_matrices_[0]
         self.weights_ = self.best_matrices_[1]
         self.stretch_ = self.best_matrices_[2]
+        self.decay_rates_ = self.best_matrices_[3]
 
         # Normalize weights/stretch first
         weights_row_max = np.max(self.weights_, axis=1, keepdims=True)
@@ -532,7 +711,11 @@ class SNMFOptimizer:
         self._prev_grad_components = np.zeros_like(
             self.components_
         )  # Previous gradient of X (zeros for now)
-        self._fill_tail_zero = True
+        # Keep the fitting model's endpoint extrapolation for the new API.
+        # Existing calls retain the original zero-tail normalization.
+        self._fill_tail_zero = not (
+            np.any(self._damping_mask) or self._use_r_grid
+        )
         try:
             self.residuals_ = self._get_residual_matrix()
             self.objective_function_ = self._get_objective_function()
@@ -613,6 +796,7 @@ class SNMFOptimizer:
                     self.components_.copy(),
                     self.weights_.copy(),
                     self.stretch_.copy(),
+                    self.decay_rates_.copy(),
                 ]
             if self._plotter is not None:
                 self._plotter.update(
@@ -644,6 +828,7 @@ class SNMFOptimizer:
                     self.components_.copy(),
                     self.weights_.copy(),
                     self.stretch_.copy(),
+                    self.decay_rates_.copy(),
                 ]
             if self._plotter is not None:
                 self._plotter.update(
@@ -686,6 +871,7 @@ class SNMFOptimizer:
                     self.components_.copy(),
                     self.weights_.copy(),
                     self.stretch_.copy(),
+                    self.decay_rates_.copy(),
                 ]
             if self._plotter is not None:
                 self._plotter.update(
@@ -695,8 +881,32 @@ class SNMFOptimizer:
                     update_tag="stretch",
                 )
 
+        if np.any(self._damping_mask):
+            self._update_decay_rates()
+            self.residuals_ = self._get_residual_matrix()
+            self.objective_function_ = self._get_objective_function()
+            self.objective_log.append(
+                {
+                    "step": "d",
+                    "iteration": self._outer_iter,
+                    "objective": self.objective_function_,
+                    "timestamp": time.time(),
+                }
+            )
+            self.objective_difference_ = (
+                self.objective_log[-2]["objective"] - self.objective_function_
+            )
+            if self.objective_function_ < self.best_objective_:
+                self.best_objective_ = self.objective_function_
+                self.best_matrices_ = [
+                    self.components_.copy(),
+                    self.weights_.copy(),
+                    self.stretch_.copy(),
+                    self.decay_rates_.copy(),
+                ]
+
     def _get_residual_matrix(
-        self, components=None, weights=None, stretch=None
+        self, components=None, weights=None, stretch=None, decay_rates=None
     ):
         """Return the residuals (difference) between the source matrix
         and its reconstruction.
@@ -706,6 +916,7 @@ class SNMFOptimizer:
         components : (signal_len, n_components) array, optional
         weights    : (n_components, n_signals) array, optional
         stretch    : (n_components, n_signals) array, optional
+        decay_rates : (n_components, n_signals) array, optional
 
         Returns
         -------
@@ -724,22 +935,32 @@ class SNMFOptimizer:
                 components=components,
                 weights=weights,
                 stretch=stretch,
+                decay_rates=decay_rates,
             )
         else:
             reconstructed_matrix = _reconstruct_matrix(
-                components, weights, stretch
+                components,
+                weights,
+                stretch,
+                decay_rates=(
+                    (self.decay_rates_ if decay_rates is None else decay_rates)
+                    if np.any(self._damping_mask)
+                    else None
+                ),
+                r=self.r_ if self._use_r_grid else None,
             )
         residuals = reconstructed_matrix - self._source_matrix
 
         return residuals
 
     def _reconstruct_from_stretched_components(
-        self, components=None, weights=None, stretch=None
+        self, components=None, weights=None, stretch=None, decay_rates=None
     ):
         stretched_components, _, _ = self._compute_stretched_components(
             components=components,
             weights=weights,
             stretch=stretch,
+            decay_rates=decay_rates,
         )
         intermediate = stretched_components.flatten(order="F").reshape(
             (self.signal_length_ * self.n_signals_, self.n_components_),
@@ -751,7 +972,7 @@ class SNMFOptimizer:
         )
 
     def _get_objective_function(
-        self, residuals=None, stretch=None, components=None
+        self, residuals=None, stretch=None, components=None, decay_rates=None
     ):
         """Return the objective value, passing stored attributes or
         overrides to _compute_objective_function().
@@ -764,6 +985,8 @@ class SNMFOptimizer:
             Stretch matrix to use instead of self.stretch_.
         components : ndarray, optional
             Component matrix to use instead of self.components_.
+        decay_rates : ndarray, optional
+            Decay rates to use instead of self.decay_rates_.
 
         Returns
         -------
@@ -779,10 +1002,10 @@ class SNMFOptimizer:
             rho=self.rho,
             eta=self.eta,
             spline_smooth_operator=self._spline_smooth_operator,
-        )
+        ) + self._damping_penalty(decay_rates)
 
     def _compute_stretched_components(
-        self, components=None, weights=None, stretch=None
+        self, components=None, weights=None, stretch=None, decay_rates=None
     ):
         """Interpolates each component along its sample axis according
         to per-(component, signal) stretch factors, then applies
@@ -799,11 +1022,13 @@ class SNMFOptimizer:
             Per-(component, signal) weights.
         stretch : array, shape (n_components, n_signals)
             Per-(component, signal) stretch factors.
+        decay_rates : array, shape (n_components, n_signals), optional
+            Rates evaluated at the observed coordinates, after stretching.
 
         Outputs
         -------
         stretched_components : array, shape (signal_len, n_comps * n_sigs)
-            Interpolated and weighted components.
+            Interpolated, weighted, and optionally damped components.
         d_stretched_components : array, shape (signal_len, n_comps * n_sigs)
             First derivatives with respect to stretch.
         dd_stretched_components : array, shape (signal_len, n_comps * n_sigs)
@@ -826,14 +1051,10 @@ class SNMFOptimizer:
         # Guard stretches
         eps = 1e-8
         stretch = np.clip(stretch, eps, None)
-        stretch_inv = 1.0 / stretch
 
         # Apply stretching to the original sample indices,
         # represented as a "time-stretch"
-        t = (
-            np.arange(signal_len, dtype=float)[:, None, None]
-            * stretch_inv[None, :, :]
-        )
+        t, di, ddi = self._interpolation_coordinates(stretch)
         # has shape (signal_len, n_components, n_signals)
 
         # For each stretched coordinate, find its prior integer (original)
@@ -862,16 +1083,17 @@ class SNMFOptimizer:
         interp_weighted = interp * weights[None, :, :]
 
         # Derivatives
-        di = -t * stretch_inv[None, :, :]  # first-derivative coefficient
-        ddi = (
-            -di * stretch_inv[None, :, :] * 2.0
-        )  # second-derivative coefficient
-
         d_unweighted = c0 * (-di) + c1 * di
         dd_unweighted = c0 * (-ddi) + c1 * ddi
 
         d_weighted = d_unweighted * weights[None, :, :]
         dd_weighted = dd_unweighted * weights[None, :, :]
+
+        if np.any(getattr(self, "_damping_mask", False)):
+            damping = self._damping_factors(decay_rates)
+            interp_weighted *= damping
+            d_weighted *= damping
+            dd_weighted *= damping
 
         # Flatten back to expected shape (signal_len, n_components * n_signals)
         return (
@@ -960,6 +1182,8 @@ class SNMFOptimizer:
     def _compute_component_gradient_zero_tail(
         self, stretch=None, weights=None, residuals=None
     ):
+        """Apply the interpolation adjoint, using the current tail
+        policy."""
         if stretch is None:
             stretch = self.stretch_
         stretch = self._expand_stretch(stretch)
@@ -969,26 +1193,54 @@ class SNMFOptimizer:
             residuals = self.residuals_
 
         gradient = np.zeros_like(self.components_)
+        positions = None
+        if getattr(self, "_use_r_grid", False):
+            positions, _, _ = self._interpolation_coordinates(stretch)
         sample_indices = np.arange(self.signal_length_, dtype=float)
+        damping = (
+            self._damping_factors()
+            if np.any(getattr(self, "_damping_mask", False))
+            else None
+        )
         for signal in range(self.n_signals_):
             for comp in range(self.n_components_):
-                positions = sample_indices / stretch[comp, signal]
-                left_indices = np.floor(positions).astype(int)
-                alpha = positions - left_indices
+                t = (
+                    sample_indices / stretch[comp, signal]
+                    if positions is None
+                    else positions[:, comp, signal]
+                )
+                left_indices = np.floor(t).astype(int)
+                alpha = t - left_indices
                 right_indices = left_indices + 1
                 scaled_residual = residuals[:, signal] * weights[comp, signal]
+                if damping is not None:
+                    scaled_residual = (
+                        scaled_residual * damping[:, comp, signal]
+                    )
 
-                left_mask = left_indices < self.signal_length_
+                left_mask = (
+                    left_indices < self.signal_length_
+                    if self._fill_tail_zero
+                    else np.ones(t.shape, dtype=bool)
+                )
                 np.add.at(
                     gradient[:, comp],
-                    left_indices[left_mask],
+                    np.clip(
+                        left_indices[left_mask], 0, self.signal_length_ - 1
+                    ),
                     scaled_residual[left_mask] * (1.0 - alpha[left_mask]),
                 )
 
-                right_mask = right_indices < self.signal_length_
+                right_mask = (
+                    right_indices < self.signal_length_
+                    if self._fill_tail_zero
+                    else np.ones(t.shape, dtype=bool)
+                )
                 np.add.at(
                     gradient[:, comp],
-                    right_indices[right_mask],
+                    np.clip(
+                        right_indices[right_mask], 0, self.signal_length_ - 1
+                    ),
                     scaled_residual[right_mask] * alpha[right_mask],
                 )
 
@@ -1068,7 +1320,11 @@ class SNMFOptimizer:
             reshaped_stretched_components - self._source_matrix
         )
         # Compute gradient
-        if self._fill_tail_zero:
+        if (
+            self._fill_tail_zero
+            or np.any(getattr(self, "_damping_mask", False))
+            or getattr(self, "_use_r_grid", False)
+        ):
             self._grad_components = self._compute_component_gradient_zero_tail(
                 residuals=component_residuals
             )
@@ -1158,11 +1414,20 @@ class SNMFOptimizer:
             for comp in range(self.n_components_):
                 pos = sample_indices / this_stretch[comp]
                 stretched_comps[:, comp] = np.interp(
-                    pos,
-                    sample_indices,
+                    (
+                        self.r_ / this_stretch[comp]
+                        if self._use_r_grid
+                        else pos
+                    ),
+                    self.r_ if self._use_r_grid else sample_indices,
                     self.components_[:, comp],
                     left=self.components_[0, comp],
                     right=self.components_[-1, comp],
+                )
+
+            if np.any(self._damping_mask):
+                stretched_comps *= np.exp(
+                    -self.r_[:, None] * self.decay_rates_[:, signal][None, :]
                 )
 
             # Solve quadratic problem for a given signal and update its weight
@@ -1170,6 +1435,65 @@ class SNMFOptimizer:
                 t=stretched_comps, m=signal
             )
             self.weights_[:, signal] = new_weight
+
+    def _decay_objective_and_gradient(self, rate_variables):
+        """Evaluate the objective and analytic gradient for selected
+        rates."""
+        rates = np.zeros_like(self.decay_rates_)
+        rates[self._damping_mask] = np.asarray(rate_variables).reshape(
+            (-1, self.n_signals_)
+        )
+        contributions, _, _ = self._compute_stretched_components(
+            decay_rates=rates
+        )
+        contributions = contributions.reshape(
+            self.signal_length_, self.n_components_, self.n_signals_
+        )
+        residuals = contributions.sum(axis=1) - self._source_matrix
+        gradient = -np.sum(
+            self.r_[:, None, None] * contributions * residuals[:, None, :],
+            axis=0,
+        )
+        gradient += (
+            self.damping_regularization
+            * (
+                self._rate_smooth_operator.T
+                @ (self._rate_smooth_operator @ rates.T)
+            ).T
+        )
+        return (
+            self._get_objective_function(
+                residuals=residuals, decay_rates=rates
+            ),
+            gradient[self._damping_mask].ravel(),
+        )
+
+    def _update_decay_rates(self):
+        """Fit selected rates with exact zero lower bounds using
+        L-BFGS-B."""
+        if not np.any(self._damping_mask):
+            return
+        if self.verbose:
+            print("Updating decay rates...")
+        initial = self.decay_rates_[self._damping_mask].ravel()
+        current_objective, _ = self._decay_objective_and_gradient(initial)
+        result = minimize(
+            self._decay_objective_and_gradient,
+            initial,
+            method="L-BFGS-B",
+            jac=True,
+            bounds=[(0.0, None)] * initial.size,
+            options={"maxiter": 100, "ftol": 1e-12, "gtol": 1e-8},
+        )
+        candidate = np.maximum(result.x, 0.0)
+        if not np.all(np.isfinite(candidate)):
+            return
+        candidate_objective, _ = self._decay_objective_and_gradient(candidate)
+        if candidate_objective <= current_objective:
+            self.decay_rates_[self._damping_mask] = candidate.reshape(
+                (-1, self.n_signals_)
+            )
+        self.decay_rates_[~self._damping_mask] = 0.0
 
     def _stretch_residual_and_derivatives(self, stretch):
         stretched_components, d_stretch_comps, dd_stretch_comps = (
@@ -1511,7 +1835,9 @@ def _cubic_largest_real_root(p, q):
     return np.where(q_is_zero, zero_q_root, general_root)
 
 
-def _reconstruct_matrix(components, weights, stretch):
+def _reconstruct_matrix(
+    components, weights, stretch, decay_rates=None, r=None
+):
     """Construct the approximation of the source matrix corresponding to
     the given components, weights, and stretch factors.
 
@@ -1523,6 +1849,10 @@ def _reconstruct_matrix(components, weights, stretch):
     components : (signal_len, n_components) array
     weights    : (n_components, n_signals) array
     stretch    : (n_components, n_signals) array
+    decay_rates : (n_components, n_signals) array, optional
+        Nonnegative decay rates. Omitted rates give the original model.
+    r : (signal_len,) array, optional
+        Coordinates for stretching and damping; defaults to sample indices.
 
     Returns
     -------
@@ -1533,10 +1863,10 @@ def _reconstruct_matrix(components, weights, stretch):
     n_signals = weights.shape[1]
 
     reconstructed_matrix = np.zeros((signal_len, n_signals))
-    sample_indices = np.arange(signal_len)
+    sample_indices = np.arange(signal_len) if r is None else np.asarray(r)
 
     for comp in range(n_components):  # loop over components
-        reconstructed_matrix += (
+        contribution = (
             np.interp(
                 sample_indices[:, None]
                 / stretch[comp][
@@ -1549,5 +1879,10 @@ def _reconstruct_matrix(components, weights, stretch):
             )
             * weights[comp][None, :]  # broadcast (n_signals,) over rows
         )
+        if decay_rates is not None:
+            contribution *= np.exp(
+                -sample_indices[:, None] * decay_rates[comp][None, :]
+            )
+        reconstructed_matrix += contribution
 
     return reconstructed_matrix
