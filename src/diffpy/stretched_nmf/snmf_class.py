@@ -1,5 +1,6 @@
 import csv
 import time
+import warnings
 
 import cvxpy as cp
 import numpy as np
@@ -310,7 +311,7 @@ class SNMFOptimizer:
             self._damping_mask[indices.astype(int)] = True
         self.decay_rates_ = np.zeros(expected_weights_shape)
         if init_decay_rates is not None:
-            rates = np.asarray(init_decay_rates, dtype=float)
+            rates = np.asarray(init_decay_rates, dtype=float).copy()
             if rates.shape != expected_weights_shape:
                 raise ValueError(
                     "init_decay_rates must have shape "
@@ -321,10 +322,13 @@ class SNMFOptimizer:
                     "init_decay_rates must be finite and non-negative."
                 )
             if np.any(rates[~self._damping_mask] != 0):
-                raise ValueError(
-                    "init_decay_rates must be zero for components excluded "
-                    "from damping."
+                warnings.warn(
+                    "init_decay_rates for components excluded from damping "
+                    "will be set to zero.",
+                    UserWarning,
+                    stacklevel=2,
                 )
+                rates[~self._damping_mask] = 0.0
             self.decay_rates_ = rates.copy()
 
         self._init_components = self.components_.copy()
@@ -471,8 +475,9 @@ class SNMFOptimizer:
             the previous factor matrices are reused.
         init_decay_rates : ndarray, optional
             Initial nonnegative decay rates of shape
-            ``(n_components, n_signals)``. Defaults to zero. Excluded
-            components must have rates zero, including when damping is off.
+            ``(n_components, n_signals)``. Defaults to zero. Rates for
+            components excluded from damping are set to zero with a warning
+            if initialized as nonzero.
         r : ndarray, optional
             Finite, nonnegative, strictly increasing coordinates with one
             entry per source row. Used both for stretching at ``r / a`` and
