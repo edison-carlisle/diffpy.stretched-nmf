@@ -90,8 +90,8 @@ Optional exponential damping
 ----------------------------
 
 Damping is off by default. Select the components to fit by their zero-based
-indices, for example ``damping_components=[0, 2]`` to fit rates for the first
-and third components. A selected component contributes
+indices, for example ``damping_components=[0, 1]`` to fit rates for the first
+and second components. A selected component contributes
 
 .. math::
 
@@ -100,7 +100,7 @@ and third components. A selected component contributes
 Each selected component has a separate nonnegative rate for each signal
 (column) ``m``. Components excluded from damping keep rates exactly zero.
 The rate is :math:`\lambda = 1 / \xi`, in inverse units of ``r``. A rate
-of zero represents the original undamped model exactly, with infinite decay
+of zero represents the original undamped model exactly, with infinite correlation
 length. Damping can be fitted with ``rho=0`` (no stretching) or combined with
 component-specific or uniform stretching.
 
@@ -109,15 +109,15 @@ component-specific or uniform stretching.
    r = np.linspace(0.0, 30.0, source_matrix.shape[0])
    snmf = SNMFOptimizer(
        n_components=3,
-       damping_components=[0, 2],
+       damping_components=[0, 1],
        damping_regularization=1.0,
        random_state=7,
    )
    snmf.fit(source_matrix, r=r)
    rates = snmf.decay_rates_  # shape (3, number_of_signals)
-   # rates[1, :] is exactly zero: component 1 is excluded.
-   decay_lengths = np.full_like(rates, np.inf)
-   np.divide(1.0, rates, out=decay_lengths, where=rates > 0)
+   # rates[2, :] is exactly zero: component 2 is excluded.
+   correlation_lengths = np.full_like(rates, np.inf)
+   np.divide(1.0, rates, out=correlation_lengths, where=rates > 0)
 
 ``r`` must be a finite, nonnegative, strictly increasing array with one
 coordinate per source row. The profiles are interpolated at ``r / a`` on
@@ -147,7 +147,7 @@ Rates retain their physical units through result normalization. Warm starts
 When profiles are free, a common decay envelope can be absorbed into a
 component profile. For example, without stretching, replacing ``x(r)`` with
 ``x(r) * exp(-c * r)`` and every rate with ``lambda - c`` gives the same
-reconstruction whenever the new rates remain nonnegative. Absolute decay
+reconstruction whenever the new rates remain nonnegative. Absolute correlation
 lengths therefore require an undamped reference signal or prior information
 about the component profiles. Initialization and regularization can influence
 which solution the optimizer finds.
