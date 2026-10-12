@@ -755,6 +755,7 @@ class SNMFOptimizer:
                         components=self.components_,
                         weights=self.weights_,
                         stretch=self.stretch_,
+                        decay_rates=self.decay_rates_,
                         update_tag="normalize components",
                     )
                 convergence_threshold = self.objective_function_ * self.tol
@@ -808,6 +809,7 @@ class SNMFOptimizer:
                     components=self.components_,
                     weights=self.weights_,
                     stretch=self.stretch_,
+                    decay_rates=self.decay_rates_,
                     update_tag="components",
                 )
 
@@ -840,6 +842,7 @@ class SNMFOptimizer:
                     components=self.components_,
                     weights=self.weights_,
                     stretch=self.stretch_,
+                    decay_rates=self.decay_rates_,
                     update_tag="weights",
                 )
 
@@ -883,6 +886,7 @@ class SNMFOptimizer:
                     components=self.components_,
                     weights=self.weights_,
                     stretch=self.stretch_,
+                    decay_rates=self.decay_rates_,
                     update_tag="stretch",
                 )
 
@@ -909,6 +913,15 @@ class SNMFOptimizer:
                     self.stretch_.copy(),
                     self.decay_rates_.copy(),
                 ]
+
+            if self._plotter is not None:
+                self._plotter.update(
+                    components=self.components_,
+                    weights=self.weights_,
+                    stretch=self.stretch_,
+                    decay_rates=self.decay_rates_,
+                    update_tag="decay rates",
+                )
 
     def _get_residual_matrix(
         self, components=None, weights=None, stretch=None, decay_rates=None
