@@ -69,6 +69,12 @@ class SNMFOptimizer:
     damping_regularization : float
         Nonnegative weight for the second-difference penalty on decay rates
         across signals, independent of ``rho`` and ``eta``.
+    smoothness_components : list of int or None
+        Zero-based component indices whose profiles receive a second-difference
+        penalty. ``None`` or an empty sequence disables the penalty.
+    smoothness_regularization : float
+        Nonnegative penalty weight for component profiles, independent of
+        ``rho``, ``eta``, and ``damping_regularization``.
     decay_rates_ : numpy.ndarray
         Nonnegative decay rates of shape ``(n_components, n_signals)`` in
         inverse units of ``r_``. Excluded components have rates exactly zero.
@@ -105,6 +111,8 @@ class SNMFOptimizer:
         uniform_stretch=False,
         damping_components=None,
         damping_regularization=0.0,
+        smoothness_components=None,
+        smoothness_regularization=0.0,
     ):
         """Initialize an instance of sNMF with estimator
         hyperparameters.
@@ -155,6 +163,13 @@ class SNMFOptimizer:
         damping_regularization : float
             Nonnegative weight for half the squared norm of the second
             differences of decay rates across signals. Defaults to zero.
+        smoothness_components : list of int or None
+            Zero-based indices of component profiles to encourage to be smooth.
+            ``None`` or ``[]`` disables the penalty.
+        smoothness_regularization : float
+            Nonnegative weight for half the squared norm of second differences
+            along the rows of selected profiles. Defaults to zero. Differences
+            follow sample order, without scaling by the spacing of ``r``.
         """
         if n_components is not None and n_components < 1:
             raise ValueError("n_components must be a positive integer.")
@@ -172,6 +187,14 @@ class SNMFOptimizer:
                 "damping_regularization must be finite and non-negative."
             )
 
+        if (
+            not np.isfinite(smoothness_regularization)
+            or smoothness_regularization < 0
+        ):
+            raise ValueError(
+                "smoothness_regularization must be finite and non-negative."
+            )
+
         self.n_components = n_components
         self.max_iter = max_iter
         self.min_iter = min_iter
@@ -186,6 +209,8 @@ class SNMFOptimizer:
         self.uniform_stretch = uniform_stretch
         self.damping_components = damping_components
         self.damping_regularization = damping_regularization
+        self.smoothness_components = smoothness_components
+        self.smoothness_regularization = smoothness_regularization
 
         self._rng = np.random.default_rng(self.random_state)
         self._plotter = SNMFPlotter() if self.show_plots else None
@@ -309,6 +334,32 @@ class SNMFOptimizer:
                     "component indices less than n_components."
                 )
             self._damping_mask[indices.astype(int)] = True
+        self._smoothness_mask = np.zeros(n_components, dtype=bool)
+        if self.smoothness_components is not None:
+            indices = np.asarray(self.smoothness_components)
+            if indices.ndim != 1 or (
+                indices.size
+                and (
+                    indices.dtype.kind not in "iu"
+                    or np.any(indices < 0)
+                    or np.any(indices >= n_components)
+                )
+            ):
+                raise ValueError(
+                    "smoothness_components must be a sequence of zero-based "
+                    "component indices less than n_components."
+                )
+            self._smoothness_mask[indices.astype(int)] = True
+        self._component_smooth_operator = (
+            diags(
+                [1, -2, 1],
+                offsets=[0, 1, 2],
+                shape=(self.signal_length_ - 2, self.signal_length_),
+                dtype=float,
+            )
+            if self.signal_length_ >= 3
+            else csr_matrix((0, self.signal_length_))
+        )
         self.decay_rates_ = np.zeros(expected_weights_shape)
         if init_decay_rates is not None:
             rates = np.asarray(init_decay_rates, dtype=float).copy()
@@ -350,6 +401,35 @@ class SNMFOptimizer:
             else csr_matrix((0, self.n_signals_))
         )
         self._spline_smooth_operator = 0.25 * self._rate_smooth_operator
+
+    def _component_smoothness_penalty(self, components=None):
+        """Return half the weighted squared second differences of
+        profiles."""
+        if not self.smoothness_regularization or not np.any(
+            self._smoothness_mask
+        ):
+            return 0.0
+        components = self.components_ if components is None else components
+        differences = (
+            self._component_smooth_operator
+            @ components[:, self._smoothness_mask]
+        )
+        return 0.5 * self.smoothness_regularization * np.sum(differences**2)
+
+    def _component_smoothness_gradient(self):
+        """Return the profile penalty gradient, zero for excluded
+        columns."""
+        gradient = np.zeros_like(self.components_)
+        if self.smoothness_regularization and np.any(self._smoothness_mask):
+            operator = self._component_smooth_operator
+            gradient[:, self._smoothness_mask] = (
+                self.smoothness_regularization
+                * (
+                    operator.T
+                    @ (operator @ self.components_[:, self._smoothness_mask])
+                )
+            )
+        return gradient
 
     def _set_r_grid(self, r):
         """Store the independent coordinates without changing legacy
@@ -597,6 +677,7 @@ class SNMFOptimizer:
             - regularization_term
             - sparsity_term
             - self._damping_penalty()
+            - self._component_smoothness_penalty()
         )
         if self.verbose:
             print(
@@ -632,6 +713,7 @@ class SNMFOptimizer:
                 - regularization_term
                 - sparsity_term
                 - self._damping_penalty()
+                - self._component_smoothness_penalty()
             )
             convergence_threshold = self.objective_function_ * self.tol
             # Convergence check: Stop if diffun is small
@@ -1011,16 +1093,22 @@ class SNMFOptimizer:
         float
             Current objective function value.
         """
-        return SNMFOptimizer._compute_objective_function(
-            components=self.components_ if components is None else components,
-            residuals=self.residuals_ if residuals is None else residuals,
-            stretch=self._expand_stretch(
-                self.stretch_ if stretch is None else stretch
-            ),
-            rho=self.rho,
-            eta=self.eta,
-            spline_smooth_operator=self._spline_smooth_operator,
-        ) + self._damping_penalty(decay_rates)
+        return (
+            SNMFOptimizer._compute_objective_function(
+                components=(
+                    self.components_ if components is None else components
+                ),
+                residuals=self.residuals_ if residuals is None else residuals,
+                stretch=self._expand_stretch(
+                    self.stretch_ if stretch is None else stretch
+                ),
+                rho=self.rho,
+                eta=self.eta,
+                spline_smooth_operator=self._spline_smooth_operator,
+            )
+            + self._damping_penalty(decay_rates)
+            + self._component_smoothness_penalty(components)
+        )
 
     def _compute_stretched_components(
         self, components=None, weights=None, stretch=None, decay_rates=None
@@ -1342,6 +1430,10 @@ class SNMFOptimizer:
             self._fill_tail_zero
             or np.any(getattr(self, "_damping_mask", False))
             or getattr(self, "_use_r_grid", False)
+            or (
+                self.smoothness_regularization
+                and np.any(getattr(self, "_smoothness_mask", False))
+            )
         ):
             self._grad_components = self._compute_component_gradient_zero_tail(
                 residuals=component_residuals
@@ -1351,10 +1443,16 @@ class SNMFOptimizer:
                 residuals=component_residuals
             ).toarray()  # toarray equivalent of full, make non-sparse
 
+        if self.smoothness_regularization:
+            self._grad_components += self._component_smoothness_gradient()
+
         # Compute initial step size `initial_step_size`
         initial_step_size = np.linalg.eigvalsh(
             self.weights_.T @ self.weights_
         ).max() * np.max([self.stretch_.max(), 1 / self.stretch_.min()])
+        if self.smoothness_regularization and np.any(self._smoothness_mask):
+            # ||D2||^2 <= 16 bounds the additional gradient curvature.
+            initial_step_size += 16 * self.smoothness_regularization
         # Compute adaptive step size `step_size`
         if self._outer_iter == 0 and self._inner_iter == 0:
             step_size = initial_step_size

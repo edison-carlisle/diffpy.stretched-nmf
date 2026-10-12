@@ -152,6 +152,45 @@ lengths therefore require an undamped reference signal or prior information
 about the component profiles. Initialization and regularization can influence
 which solution the optimizer finds.
 
+Smooth component profiles
+-------------------------
+
+Use ``smoothness_components`` to select component profiles by zero-based
+index and ``smoothness_regularization`` to control their second-difference
+penalty. For example, to encourage the second component to be smooth:
+
+.. code-block:: python
+
+   snmf = SNMFOptimizer(
+       n_components=3,
+       smoothness_components=[1],
+       smoothness_regularization=1.0,
+       random_state=7,
+   )
+   snmf.fit(source_matrix)
+
+The objective gains the term
+
+.. math::
+
+   \frac{\text{smoothness_regularization}}{2}
+   \sum_{k \in \text{smoothness_components}} \sum_{i=0}^{N-3}
+   (x_k^{i+2} - 2x_k^{i+1} + x_k^i)^2.
+
+This penalizes curvature along the rows of the selected component profiles,
+prior to stretching and damping. Other profiles receive no smoothness penalty.
+Larger weights encourage smoother profiles at the cost of reconstruction
+accuracy. Constant and linear profiles have zero penalty; fewer than three
+rows also give zero penalty. Differences follow row order and are not scaled
+by the spacing of ``r``, so the penalty assumes equally spaced samples.
+
+The default is off: ``None`` or ``[]`` for ``smoothness_components``, or a
+zero ``smoothness_regularization``, disables the penalty. The strength must
+be finite and nonnegative. This option is independent of ``rho``, ``eta``,
+and ``damping_regularization`` and can be combined with stretching, sparsity,
+and exponential damping. It remains active during result normalization and
+warm starts (``reset=False``).
+
 XRD example
 -----------
 
