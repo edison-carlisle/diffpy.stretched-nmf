@@ -328,7 +328,6 @@ def test_invalid_damping_regularization_is_rejected(regularization):
         (np.ones((1, 3)), "shape"),
         (np.array([[0, 0, 0], [-0.1, 0, 0]]), "non-negative"),
         (np.array([[0, 0, 0], [np.inf, 0, 0]]), "finite"),
-        (np.array([[0.1, 0, 0], [0, 0, 0]]), "excluded"),
     ],
 )
 def test_invalid_initial_rates_are_rejected(rates, message):
@@ -336,6 +335,22 @@ def test_invalid_initial_rates_are_rejected(rates, message):
         SNMFOptimizer(n_components=2, damping_components=[1]).fit(
             np.ones((5, 3)), init_decay_rates=rates
         )
+
+
+@pytest.mark.parametrize("damping_components", [None, [1]])
+def test_excluded_initial_rates_are_zeroed_with_warning(damping_components):
+    rates = np.full((2, 3), 0.1)
+    original_rates = rates.copy()
+    model = SNMFOptimizer(
+        n_components=2, damping_components=damping_components
+    )
+    with pytest.warns(UserWarning, match="excluded from damping"):
+        model._initialize_factors(np.ones((5, 3)), init_decay_rates=rates)
+    expected = np.zeros_like(rates)
+    if damping_components is not None:
+        expected[1] = original_rates[1]
+    np.testing.assert_array_equal(model.decay_rates_, expected)
+    np.testing.assert_array_equal(rates, original_rates)
 
 
 @pytest.mark.parametrize(
